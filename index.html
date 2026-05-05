@@ -1179,58 +1179,288 @@ input[list]{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3
 const SK = 'uniflex_v4';
 
 // ═══════════════════════════════════════════════════
-// CLOUDFLARE D1 CONFIG
+// LOCAL FILE STORAGE (File System Access API + IndexedDB)
 // ═══════════════════════════════════════════════════
-const CF_WORKER = 'https://uniflex-gestionale-api.masquaglia.workers.dev';
-const CF_KEY = 'UNI-2026-xK9mP3qR7wL5nJ2vB8cF4hD6tY1sA0eG';
+// Salva i dati in un file JSON sul disco locale dell'utente.
+// Il file handle viene memorizzato in IndexedDB per essere riaperto
+// automaticamente alle sessioni successive.
 
-let _sbSyncTimer = null;
+const STORAGE = {
+  fileHandle: null,         // FileSystemFileHandle del DB attivo
+  fileName: null,           // nome file per UI
+  saveTimer: null,          // timer del debounce
+  isDirty: false,           // modifiche pendenti?
+  isSaving: false,          // save in corso?
+  mode: 'none',             // 'file' | 'localStorage' | 'none'
+  hasFileSystemAPI: ('showOpenFilePicker' in window) && ('showSaveFilePicker' in window)
+};
 
-// Salva su D1 (debounce 4 sec)
-function sbScheduleSync(){
-  clearTimeout(_sbSyncTimer);
-  _sbSyncTimer = setTimeout(sbSync, 4000);
+const IDB_NAME = 'uniflex_hr_handle_store';
+const IDB_KEY  = 'uniflex_hr_handle';
+
+// ── IndexedDB helpers (per persistere il file handle) ──
+function idbOpen(){
+  return new Promise((resolve, reject)=>{
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = ()=>{
+      req.result.createObjectStore('handles');
+    };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror   = ()=>reject(req.error);
+  });
+}
+async function idbSetHandle(handle){
+  const db = await idbOpen();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction('handles', 'readwrite');
+    tx.objectStore('handles').put(handle, IDB_KEY);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror    = ()=>reject(tx.error);
+  });
+}
+async function idbGetHandle(){
+  try{
+    const db = await idbOpen();
+    return new Promise((resolve)=>{
+      const tx = db.transaction('handles', 'readonly');
+      const req = tx.objectStore('handles').get(IDB_KEY);
+      req.onsuccess = ()=>resolve(req.result || null);
+      req.onerror   = ()=>resolve(null);
+    });
+  }catch(e){ return null; }
+}
+async function idbClearHandle(){
+  try{
+    const db = await idbOpen();
+    return new Promise((resolve)=>{
+      const tx = db.transaction('handles', 'readwrite');
+      tx.objectStore('handles').delete(IDB_KEY);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror    = ()=>resolve();
+    });
+  }catch(e){}
 }
 
-async function sbSync(){
+// ── Verifica/richiede permessi rw sul file handle ──
+async function ensureRwPermission(handle){
+  if(!handle) return false;
+  try{
+    const opts = { mode: 'readwrite' };
+    if((await handle.queryPermission(opts)) === 'granted') return true;
+    if((await handle.requestPermission(opts)) === 'granted') return true;
+    return false;
+  }catch(e){ return false; }
+}
+
+// ── Salvataggio: schedula con debounce 1.5s ──
+function sbScheduleSync(){
+  STORAGE.isDirty = true;
+  updateStorageBadge();
+  clearTimeout(STORAGE.saveTimer);
+  STORAGE.saveTimer = setTimeout(_storageSaveNow, 1500);
+}
+
+// ── Scrittura effettiva su file ──
+async function _storageSaveNow(){
+  if(STORAGE.isSaving) return;
+  STORAGE.isSaving = true;
+  updateStorageBadge();
   try{
     const payload = localStorage.getItem(SK);
-    if(!payload) return;
-    sbSetStatus('sync');
-    const res = await fetch(`${CF_WORKER}/data`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Api-Key': CF_KEY },
-      body: payload
-    });
-    if(res.ok){
-      sbSetStatus('ok');
-    } else {
-      sbSetStatus('err');
+    if(!payload){ STORAGE.isSaving = false; return; }
+
+    if(STORAGE.mode === 'file' && STORAGE.fileHandle){
+      const ok = await ensureRwPermission(STORAGE.fileHandle);
+      if(!ok){ throw new Error('Permessi negati sul file'); }
+      const writable = await STORAGE.fileHandle.createWritable();
+      await writable.write(payload);
+      await writable.close();
     }
+    // Se mode === 'localStorage' o 'none', il dato è già in localStorage (fallback)
+
+    STORAGE.isDirty = false;
+    STORAGE.lastSave = new Date();
   }catch(e){
+    console.error('Errore salvataggio file:', e);
     sbSetStatus('err');
+  }finally{
+    STORAGE.isSaving = false;
+    updateStorageBadge();
   }
 }
 
-async function sbLoad(){
+// ── Carica dati dal file ──
+async function storageLoadFromFile(){
+  if(!STORAGE.fileHandle) return null;
   try{
-    const res = await fetch(`${CF_WORKER}/data`, {
-      headers: { 'X-Api-Key': CF_KEY }
-    });
-    if(!res.ok) return null;
-    const data = await res.json();
+    const ok = await ensureRwPermission(STORAGE.fileHandle);
+    if(!ok) return null;
+    const file = await STORAGE.fileHandle.getFile();
+    const text = await file.text();
+    if(!text) return null;
+    const data = JSON.parse(text);
     if(!data || !data.rows) return null;
-    return { payload: data };
-  }catch(e){ return null; }
+    return data;
+  }catch(e){
+    console.error('Errore lettura file:', e);
+    return null;
+  }
 }
 
-function sbSetStatus(s){
+// ── Crea nuovo file DB (showSaveFilePicker) ──
+async function storageCreateNew(){
+  if(!STORAGE.hasFileSystemAPI) return false;
+  try{
+    const handle = await window.showSaveFilePicker({
+      suggestedName: 'uniflex_hr.json',
+      types: [{ description: 'Uniflex HR Database', accept: { 'application/json': ['.json'] } }]
+    });
+    STORAGE.fileHandle = handle;
+    STORAGE.fileName   = handle.name;
+    STORAGE.mode       = 'file';
+    await idbSetHandle(handle);
+    // Scrivi subito un payload iniziale (vuoto o con dati attuali se già caricati)
+    const payload = localStorage.getItem(SK) || JSON.stringify({rows:[],durate:{},sediList:[],inqList:[],mansioniList:[],catsList:[],nomineList:[],strumenti:[],strListe:{}});
+    const writable = await handle.createWritable();
+    await writable.write(payload);
+    await writable.close();
+    updateStorageBadge();
+    return true;
+  }catch(e){
+    if(e.name !== 'AbortError') console.error(e);
+    return false;
+  }
+}
+
+// ── Apri file DB esistente (showOpenFilePicker) ──
+async function storageOpenExisting(){
+  if(!STORAGE.hasFileSystemAPI) return null;
+  try{
+    const [handle] = await window.showOpenFilePicker({
+      types: [{ description: 'Uniflex HR Database', accept: { 'application/json': ['.json'] } }],
+      multiple: false
+    });
+    STORAGE.fileHandle = handle;
+    STORAGE.fileName   = handle.name;
+    STORAGE.mode       = 'file';
+    await idbSetHandle(handle);
+    const data = await storageLoadFromFile();
+    updateStorageBadge();
+    return data;
+  }catch(e){
+    if(e.name !== 'AbortError') console.error(e);
+    return null;
+  }
+}
+
+// ── Scollega il file corrente ──
+async function storageDetach(){
+  STORAGE.fileHandle = null;
+  STORAGE.fileName   = null;
+  STORAGE.mode       = 'localStorage';
+  await idbClearHandle();
+  updateStorageBadge();
+}
+
+// ── Aggiorna il badge in topbar ──
+function updateStorageBadge(){
   const el = document.getElementById('sb-status');
   if(!el) return;
-  if(s==='ok')  { el.textContent='☁️ Sincronizzato'; el.style.color='var(--ok)'; }
-  if(s==='err') { el.textContent='⚠️ Cloud non raggiungibile'; el.style.color='var(--warn)'; }
-  if(s==='sync'){ el.textContent='☁️ Sincronizzazione…'; el.style.color='var(--muted)'; }
-  if(s==='off') { el.textContent=''; }
+  if(STORAGE.mode === 'file' && STORAGE.fileName){
+    if(STORAGE.isSaving){
+      el.innerHTML = `📁 ${STORAGE.fileName} · <span style="color:var(--muted)">salvataggio…</span>`;
+    } else if(STORAGE.isDirty){
+      el.innerHTML = `📁 ${STORAGE.fileName} · <span style="color:var(--warn)">in attesa…</span>`;
+    } else {
+      el.innerHTML = `📁 ${STORAGE.fileName} · <span style="color:var(--ok)">salvato</span>`;
+    }
+    el.style.color = 'var(--text)';
+    el.style.cursor = 'pointer';
+    el.title = 'Clicca per cambiare file di salvataggio';
+    el.onclick = ()=>showStorageDialog();
+  } else if(STORAGE.mode === 'localStorage'){
+    el.innerHTML = '⚠️ Solo browser · <a href="#" style="color:var(--accent)">collega file</a>';
+    el.style.color = 'var(--warn)';
+    el.style.cursor = 'pointer';
+    el.onclick = ()=>showStorageDialog();
+  } else {
+    el.textContent = '';
+    el.onclick = null;
+  }
+}
+
+// ── Compatibilità: vecchia API sbSetStatus / sbLoad ──
+function sbSetStatus(s){
+  // Mantenuto solo per compatibilità con chiamate residue.
+  // Lo stato reale è gestito da updateStorageBadge().
+  updateStorageBadge();
+}
+async function sbLoad(){
+  // Compatibilità: ora carica da file locale, non da cloud
+  if(STORAGE.fileHandle){
+    const data = await storageLoadFromFile();
+    if(data) return { payload: data };
+  }
+  return null;
+}
+
+// ── Dialogo di scelta storage (primo avvio o cambio file) ──
+function showStorageDialog(){
+  const existing = document.getElementById('storage-dialog-overlay');
+  if(existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'storage-dialog-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px';
+
+  const isCompatible = STORAGE.hasFileSystemAPI;
+  const incompatNote = isCompatible ? '' : `<div style="background:#fff4e0;border:1px solid #f0c060;border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:12.5px;color:#7c4b00">⚠️ Il tuo browser non supporta il salvataggio su file. Funzionerà solo il salvataggio nel browser (più volatile). <strong>Usa Chrome o Edge</strong> per la modalità file.</div>`;
+
+  overlay.innerHTML = `
+    <div style="background:var(--surface);border-radius:14px;max-width:520px;width:100%;padding:26px 28px;box-shadow:0 20px 60px rgba(0,0,0,.3)">
+      <div style="font-size:32px;text-align:center;margin-bottom:8px">💾</div>
+      <h2 style="font-size:18px;margin:0 0 6px;text-align:center">Dove salvare i dati?</h2>
+      <p style="font-size:13px;color:var(--muted);text-align:center;margin:0 0 18px">I dati di Uniflex vengono salvati in un file JSON sul tuo PC. Scegli come collegarli.</p>
+      ${incompatNote}
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <button id="storage-btn-new" ${isCompatible?'':'disabled'} style="padding:14px 16px;border:1.5px solid var(--accent-border);background:var(--surface);border-radius:10px;cursor:pointer;text-align:left;font-size:13.5px;${isCompatible?'':'opacity:.4;cursor:not-allowed'}">
+          <div style="font-weight:600;margin-bottom:3px">📄 Crea nuovo file</div>
+          <div style="color:var(--muted);font-size:12px">Scegli dove salvare un nuovo <code>uniflex_hr.json</code> (consigliato per il primo avvio)</div>
+        </button>
+        <button id="storage-btn-open" ${isCompatible?'':'disabled'} style="padding:14px 16px;border:1.5px solid var(--accent-border);background:var(--surface);border-radius:10px;cursor:pointer;text-align:left;font-size:13.5px;${isCompatible?'':'opacity:.4;cursor:not-allowed'}">
+          <div style="font-weight:600;margin-bottom:3px">📂 Apri file esistente</div>
+          <div style="color:var(--muted);font-size:12px">Carica un <code>uniflex_hr.json</code> già creato in precedenza</div>
+        </button>
+        <button id="storage-btn-skip" style="padding:14px 16px;border:1px solid var(--border);background:transparent;border-radius:10px;cursor:pointer;text-align:left;font-size:13.5px">
+          <div style="font-weight:600;margin-bottom:3px">⚡ Solo browser (sconsigliato)</div>
+          <div style="color:var(--muted);font-size:12px">I dati restano nel browser. Rischio di perdita se cancelli i dati siti.</div>
+        </button>
+      </div>
+      <div style="text-align:center;margin-top:16px">
+        <button id="storage-btn-cancel" style="background:transparent;border:none;color:var(--muted);font-size:12px;cursor:pointer">Annulla</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+
+  return new Promise((resolve)=>{
+    const cleanup = (result)=>{ overlay.remove(); resolve(result); };
+    document.getElementById('storage-btn-new').onclick = async ()=>{
+      const ok = await storageCreateNew();
+      cleanup(ok ? 'new' : null);
+    };
+    document.getElementById('storage-btn-open').onclick = async ()=>{
+      const data = await storageOpenExisting();
+      cleanup(data ? { mode:'open', data } : null);
+    };
+    document.getElementById('storage-btn-skip').onclick = async ()=>{
+      STORAGE.mode = 'localStorage';
+      await idbClearHandle();
+      updateStorageBadge();
+      cleanup('skip');
+    };
+    document.getElementById('storage-btn-cancel').onclick = ()=>cleanup(null);
+  });
 }
 const TODAY = new Date(); TODAY.setHours(0,0,0,0);
 const PG = 30;
@@ -6267,8 +6497,7 @@ save = function(){
     localStorage.setItem(SK, JSON.stringify({rows,durate,sediList,inqList,mansioniList,catsList,nomineList,strumenti,strListe}));
     markUnsaved();
     updBadge();
-    sbSetStatus('sync');
-    sbScheduleSync();  // salva su Supabase 4 sec dopo l'ultima modifica
+    sbScheduleSync();  // salva sul file locale 1.5s dopo l'ultima modifica
   }catch(e){ toast('Errore salvataggio!','err'); }
 };
 
@@ -6305,25 +6534,41 @@ function bootWelcomeToast(data){
 (async function init(){
   // ── Mostra spinner di caricamento ──
   const uploadScr = document.getElementById('upload-screen');
-  const pw = document.getElementById('pw');
-  if(uploadScr) uploadScr.innerHTML = '<div style="text-align:center"><div style="font-size:32px;margin-bottom:12px">☁️</div><div style="font-size:14px;color:var(--muted)">Connessione al cloud…</div></div>';
+  if(uploadScr) uploadScr.innerHTML = '<div style="text-align:center"><div style="font-size:32px;margin-bottom:12px">💾</div><div style="font-size:14px;color:var(--muted)">Apertura file dati…</div></div>';
 
-  // ── 1. Prova Supabase ──
-  const sbData = await sbLoad();
-  if(sbData && sbData.payload && sbData.payload.rows){
-    try{
-      applyData(sbData.payload);
-      // Aggiorna anche localStorage come cache locale
-      localStorage.setItem(SK, JSON.stringify(sbData.payload));
-      startApp();
-      markSaved();
-      sbSetStatus('ok');
-      bootWelcomeToast(sbData.payload);
-      return;
-    }catch(e){ /* fallback */ }
+  // ── 1. Tenta di riaprire il file precedente da IndexedDB ──
+  if(STORAGE.hasFileSystemAPI){
+    const handle = await idbGetHandle();
+    if(handle){
+      const ok = await ensureRwPermission(handle);
+      if(ok){
+        STORAGE.fileHandle = handle;
+        STORAGE.fileName   = handle.name;
+        STORAGE.mode       = 'file';
+        const data = await storageLoadFromFile();
+        if(data && data.rows){
+          try{
+            applyData(data);
+            // aggiorna anche localStorage come cache locale
+            localStorage.setItem(SK, JSON.stringify(data));
+            startApp();
+            markSaved();
+            updateStorageBadge();
+            bootWelcomeToast(data);
+            return;
+          }catch(e){ /* fallback */ }
+        } else {
+          // file vuoto: mantieni il handle e mostra schermata upload
+          updateStorageBadge();
+        }
+      } else {
+        // permessi negati: pulisci handle e procedi
+        await idbClearHandle();
+      }
+    }
   }
 
-  // ── 2. Fallback: localStorage ──
+  // ── 2. Fallback: localStorage (cache del browser) ──
   const raw = localStorage.getItem(SK);
   if(raw){
     try{
@@ -6331,44 +6576,66 @@ function bootWelcomeToast(data){
       applyData(data);
       startApp();
       markSaved();
-      sbSetStatus('err');
+      // Se non c'è ancora un file collegato, avvisa l'utente
+      if(STORAGE.mode !== 'file'){
+        STORAGE.mode = 'localStorage';
+        updateStorageBadge();
+        setTimeout(()=>{
+          if(STORAGE.hasFileSystemAPI){
+            toast('💾 Dati caricati dal browser. Collega un file per salvataggio sicuro.','ok',6000);
+          }
+        },800);
+      } else {
+        updateStorageBadge();
+      }
       bootWelcomeToast(data);
-      setTimeout(()=>toast('⚠️ Cloud non raggiungibile — dati locali caricati','ok',4000),600);
       return;
     }catch(e){
       localStorage.removeItem(SK);
     }
   }
 
-  // ── 3. Nessun dato — ripristina schermata upload ──
+  // ── 3. Nessun dato — mostra schermata di benvenuto / dialogo storage ──
   updBadge();
+  STORAGE.mode = STORAGE.hasFileSystemAPI ? 'none' : 'localStorage';
+  updateStorageBadge();
+
   if(uploadScr){
     uploadScr.innerHTML = `
-      <div style="text-align:center;max-width:480px;width:100%">
-        <div id="dz-json-box" style="background:var(--surface);border:2px solid var(--accent-border);border-radius:var(--rl);padding:28px 24px;margin-bottom:14px;cursor:pointer;transition:border-color .14s" onclick="document.getElementById('fi-restore').click()" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--accent-border)'">
+      <div style="text-align:center;max-width:520px;width:100%">
+        <div style="background:var(--surface);border:2px solid var(--accent-border);border-radius:var(--rl);padding:28px 24px;margin-bottom:14px">
           <div style="font-size:38px;margin-bottom:10px">💾</div>
-          <h2 style="font-size:16px;margin-bottom:6px">Riprendi sessione</h2>
-          <p style="color:var(--muted);font-size:13px">Carica il file <strong>backup JSON</strong> salvato in precedenza.</p>
-          <p style="color:var(--accent);font-size:12px;margin-top:6px;font-weight:500">⚠️ Nessun dato trovato nel cloud o nel browser</p>
-          <br>
-          <button class="btn btn-primary" onclick="event.stopPropagation();document.getElementById('fi-restore').click()">📂 Carica backup JSON</button>
+          <h2 style="font-size:17px;margin-bottom:6px">Benvenuto in Uniflex HR</h2>
+          <p style="color:var(--muted);font-size:13px;margin-bottom:14px">Per cominciare, scegli dove salvare i tuoi dati.<br>Tutto resta sul tuo PC, nessun dato esce mai dal tuo computer.</p>
+          ${STORAGE.hasFileSystemAPI ? `
+          <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="(async()=>{const ok=await storageCreateNew();if(ok){toast('File creato! Ora carica i dati o un backup.','ok');location.reload();}})()">📄 Crea nuovo file</button>
+            <button class="btn btn-ghost" onclick="(async()=>{const data=await storageOpenExisting();if(data){applyData(data);localStorage.setItem(SK,JSON.stringify(data));startApp();markSaved();updateStorageBadge();bootWelcomeToast(data);}})()">📂 Apri file esistente</button>
+          </div>
+          ` : `
+          <p style="color:var(--warn);font-size:12px;margin-top:6px;font-weight:500">⚠️ Il tuo browser non supporta il salvataggio su file. Usa Chrome o Edge per la modalità file.</p>
+          `}
         </div>
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
           <div style="flex:1;height:1px;background:var(--border)"></div>
-          <span style="color:var(--subtle);font-size:12px">oppure inizia da zero</span>
+          <span style="color:var(--subtle);font-size:12px">oppure inizia da zero / da backup</span>
           <div style="flex:1;height:1px;background:var(--border)"></div>
         </div>
-        <div class="upload-box" id="dz" style="padding:20px 24px">
-          <div style="font-size:32px;margin-bottom:8px">📋</div>
-          <h2 style="font-size:14px">Carica il file Excel</h2>
-          <p style="font-size:12.5px;color:var(--muted)">Trascina <strong>Formazione_obbligatoria.xlsx</strong><br>oppure clicca per selezionarlo.</p>
+        <div id="dz-json-box" style="background:var(--surface);border:1px solid var(--accent-border);border-radius:var(--rl);padding:18px 20px;margin-bottom:12px;cursor:pointer" onclick="document.getElementById('fi-restore').click()">
+          <div style="font-size:24px;margin-bottom:6px">📋</div>
+          <h2 style="font-size:14px;margin-bottom:4px">Carica backup JSON</h2>
+          <p style="color:var(--muted);font-size:12px">Ripristina da un backup precedente</p>
+        </div>
+        <div class="upload-box" id="dz" style="padding:18px 20px">
+          <div style="font-size:24px;margin-bottom:6px">📊</div>
+          <h2 style="font-size:14px">Importa da Excel</h2>
+          <p style="font-size:12px;color:var(--muted)">Trascina <strong>Formazione_obbligatoria.xlsx</strong></p>
           <br>
           <button class="btn btn-ghost btn-sm" onclick="document.getElementById('fi').click()">Seleziona file Excel</button>
         </div>
         <p style="color:var(--muted);font-size:11.5px;margin-top:12px">Elaborazione 100% locale — nessun dato trasmesso</p>
       </div>`;
   }
-  sbSetStatus('off');
 })();
 </script>
 </body>
