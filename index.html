@@ -1182,6 +1182,7 @@ const SK = 'uniflex_v4';
 // CLOUDFLARE D1 CONFIG
 // ═══════════════════════════════════════════════════
 const CF_WORKER = 'https://uniflex-gestionale-api.masquaglia.workers.dev';
+const CF_KEY = 'UNI-2026-xK9mP3qR7wL5nJ2vB8cF4hD6tY1sA0eG';
 
 let _sbSyncTimer = null;
 
@@ -1198,7 +1199,7 @@ async function sbSync(){
     sbSetStatus('sync');
     const res = await fetch(`${CF_WORKER}/data`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Api-Key': CF_KEY },
       body: payload
     });
     if(res.ok){
@@ -1213,7 +1214,9 @@ async function sbSync(){
 
 async function sbLoad(){
   try{
-    const res = await fetch(`${CF_WORKER}/data`);
+    const res = await fetch(`${CF_WORKER}/data`, {
+      headers: { 'X-Api-Key': CF_KEY }
+    });
     if(!res.ok) return null;
     const data = await res.json();
     if(!data || !data.rows) return null;
